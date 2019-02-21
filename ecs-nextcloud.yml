@@ -1,0 +1,691 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Amazon ECS Service for Nextcloud with Serverless RDS, EFS & S3
+  Based on https://github.com/awslabs/aws-cloudformation-templates/blob/master/aws/services/ECS/ECS_Schedule_Example.template.
+Parameters:
+  myName:
+    Description: Deployment Name ( Unique client name, unsuffixed domain name or similar, no punctuation) # must be S3 bucketname friendly
+    Type: String
+    Default: clientname
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: Select a VPC that allows instances to access the Internet.
+  PublicSubnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: Select at least two public subnets in your selected VPC.
+  PrivateSubnets:
+    Description: Select at least two private subnets in your selected VPC
+    Type: List<AWS::EC2::Subnet::Id>
+  DesiredCapacity:
+    Type: Number
+    Default: '1'
+    Description: Number of instances to launch in your ECS cluster.
+  MaxSize:
+    Type: Number
+    Default: '1'
+    Description: Maximum number of instances that can be launched in your ECS cluster.
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarge
+    ConstraintDescription: Please choose a valid instance type.
+
+Mappings:
+  AWSRegionToAMI:
+    amazon-ecs-optimized:
+      amznami: 2017.03.f
+    us-east-1:
+      AMIID: ami-9eb4b1e5
+    us-east-2:
+      AMIID: ami-1c002379
+    us-west-1:
+      AMIID: ami-4a2c192a
+    us-west-2:
+      AMIID: ami-1d668865
+    eu-west-1:
+      AMIID: ami-8fcc32f6
+    eu-west-2:
+      AMIID: ami-cb1101af
+    eu-central-1:
+      AMIID: ami-0460cb6b
+    ap-northeast-1:
+      AMIID: ami-b743bed1
+    ap-southeast-1:
+      AMIID: ami-9d1f7efe
+    ap-southeast-2:
+      AMIID: ami-c1a6bda2
+    ca-central-1:
+      AMIID: ami-b677c9d2
+
+Resources:
+  EC2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:CreateCluster'
+                  - 'ecs:DeregisterContainerInstance'
+                  - 'ecs:DiscoverPollEndpoint'
+                  - 'ecs:Poll'
+                  - 'ecs:RegisterContainerInstance'
+                  - 'ecs:StartTelemetrySession'
+                  - 'ecs:Submit*'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  AutoscalingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'application-autoscaling:*'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:UpdateService'
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+
+  EcsSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: ECS Security Group
+      VpcId: !Ref VpcId
+
+  EcsSecurityGroupHTTPinbound:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: '80'
+      ToPort: '80'
+      CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroupSSHinbound:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: '22'
+      ToPort: '22'
+      CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroupALBports:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: '31000'
+      ToPort: '61000'
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+  CloudwatchLogsGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Join 
+        - '-'
+        - - !Sub ${myName}
+          - !Ref 'AWS::StackName'
+      RetentionInDays: 14
+
+  EFS:
+    Type: AWS::EFS::FileSystem
+    Properties: 
+      Encrypted: true
+
+  EcsTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Join 
+        - ''
+        - - !Ref 'AWS::StackName'
+          - '-ecs-nextcloud'
+      ContainerDefinitions:
+        - Name: nextcloud-fpm-alpine
+          Memory: 384
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudwatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: nextcloud
+          PortMappings:
+           - HostPort: 9000
+             Protocol: tcp
+             ContainerPort: 9000
+           - HostPort: 3306
+             Protocol: tcp
+             ContainerPort: 3306
+          MountPoints:
+           - ContainerPath: "/var/www/html"
+             SourceVolume: nextcloud
+           - ContainerPath: "/var/www/html/custom_apps"
+             SourceVolume: apps
+           - ContainerPath: "/var/www/html/config"
+             SourceVolume: config
+           - ContainerPath: "/var/www/html/data"
+             SourceVolume: data
+          Image: nextcloud:fpm-alpine
+          #Image: 665433617477.dkr.ecr.eu-west-1.amazonaws.com/gziratech-nextcloud-fpm-php:latest # ToDo - Justs adds fcgi to nextcloud:fpm-alpine
+          Essential: true
+        - Name: nextcloud-nginx
+          Memory: 384
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudwatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref myName
+          PortMappings:
+            - HostPort: 80
+              Protocol: tcp
+              ContainerPort: 80
+          VolumesFrom:
+            - SourceContainer: nextcloud-fpm-alpine
+              ReadOnly: true
+          # ToDo - copies in nginx.conf    
+          Image: 665433617477.dkr.ecr.eu-west-1.amazonaws.com/gziratech-nextcloud-nginx:latest
+          Essential: true
+          Links:
+            - nextcloud-fpm-alpine
+      Volumes:
+      - Name: nextcloud
+        DockerVolumeConfiguration:
+          Autoprovision: true
+          Scope: shared
+          Driver: local
+          DriverOpts:
+            Type: nfs
+            Device: !Sub ":/${myName}/docker-volumes/nextcloud/"
+            O: !Sub "addr=${EFS}.efs.${AWS::Region}.amazonaws.com,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport"
+      - Name: apps
+        DockerVolumeConfiguration:
+          Autoprovision: true
+          Scope: shared
+          Driver: local
+          DriverOpts:
+            Type: nfs
+            Device: !Sub ":/${myName}/docker-volumes/apps/"
+            O: !Sub "addr=${EFS}.efs.${AWS::Region}.amazonaws.com,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport"
+      - Name: config
+        DockerVolumeConfiguration:
+          Autoprovision: true
+          Scope: shared
+          Driver: local
+          DriverOpts:
+            Type: nfs
+            Device: !Sub ":/${myName}/docker-volumes/config/"
+            O: !Sub "addr=${EFS}.efs.${AWS::Region}.amazonaws.com,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport"
+      - Name: data
+        DockerVolumeConfiguration:
+          Autoprovision: true
+          Scope: shared
+          Driver: local
+          DriverOpts:
+            Type: nfs
+            Device: !Sub ":/${myName}/docker-volumes/data/"
+            O: !Sub "addr=${EFS}.efs.${AWS::Region}.amazonaws.com,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport"
+
+  ElasticLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: ElasticLoadBalancer
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref EcsSecurityGroup
+
+  LoadBalancerListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    DependsOn: ECSServiceRole
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      LoadBalancerArn: !Ref ElasticLoadBalancer
+      Port: '80'
+      Protocol: HTTP
+
+  LoadBalancerListenerRule:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    DependsOn: LoadBalancerListener
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      Conditions:
+        - Field: "path-pattern"
+          Values:
+            - "/"
+      ListenerArn: !Ref LoadBalancerListener
+      Priority: 1
+
+  LoadBalancerTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn: ElasticLoadBalancer
+    Properties:
+      HealthCheckIntervalSeconds: 10 # This might be keeping the Serverless RDS awake
+      HealthCheckPath: /status.php
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: LoadBalancerTargetGroup
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
+
+  ECSAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier: !Ref PublicSubnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: 1
+      MinSize: 1
+      DesiredCapacity: 1
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: 'true'
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata: 
+      AWS::CloudFormation::Init: 
+        config:
+          files:
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json: # ToDo osrt out ${AWS.ImageId} 
+              content: !Sub |
+                {
+                  "agent": {
+                    "metrics_collection_interval": 10,
+                    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+                  },
+                  "metrics": {
+                    "metrics_collected": {
+                      "cpu": {
+                        "resources": [
+                          "*"
+                        ],
+                        "measurement": [
+                          {"name": "cpu_usage_idle", "rename": "CPU_USAGE_IDLE", "unit": "Percent"},
+                          {"name": "cpu_usage_nice", "unit": "Percent"},
+                          "cpu_usage_guest"
+                        ],
+                        "totalcpu": false,
+                        "metrics_collection_interval": 10,
+                        "append_dimensions": {
+                          "customized_dimension_key_1": "customized_dimension_value_1",
+                          "customized_dimension_key_2": "customized_dimension_value_2"
+                        }
+                      },
+                      "disk": {
+                        "resources": [
+                          "/",
+                          "/tmp"
+                        ],
+                        "measurement": [
+                          {"name": "free", "rename": "DISK_FREE", "unit": "Gigabytes"},
+                          "total",
+                          "used"
+                        ],
+                         "ignore_file_system_types": [
+                          "sysfs", "devtmpfs"
+                        ],
+                        "metrics_collection_interval": 60,
+                        "append_dimensions": {
+                          "customized_dimension_key_3": "customized_dimension_value_3",
+                          "customized_dimension_key_4": "customized_dimension_value_4"
+                        }
+                      },
+                      "diskio": {
+                        "resources": [
+                          "*"
+                        ],
+                        "measurement": [
+                          "reads",
+                          "writes",
+                          "read_time",
+                          "write_time",
+                          "io_time"
+                        ],
+                        "metrics_collection_interval": 60
+                      },
+                      "swap": {
+                        "measurement": [
+                          "swap_used",
+                          "swap_free",
+                          "swap_used_percent"
+                        ]
+                      },
+                      "mem": {
+                        "measurement": [
+                          "mem_used",
+                          "mem_cached",
+                          "mem_total"
+                        ],
+                        "metrics_collection_interval": 1
+                      },
+                      "net": {
+                        "resources": [
+                          "eth0"
+                        ],
+                        "measurement": [
+                          "bytes_sent",
+                          "bytes_recv",
+                          "drop_in",
+                          "drop_out"
+                        ]
+                      },
+                      "netstat": {
+                        "measurement": [
+                          "tcp_established",
+                          "tcp_syn_sent",
+                          "tcp_close"
+                        ],
+                        "metrics_collection_interval": 60
+                      },
+                      "processes": {
+                        "measurement": [
+                          "running",
+                          "sleeping",
+                          "dead"
+                        ]
+                      }
+                    },
+                    "append_dimensions": {
+                      "ImageId": "{aws:ImageId}",
+                      "InstanceId": "{aws:InstanceId}",
+                      "InstanceType": "{aws:InstanceType}",
+                      "AutoScalingGroupName": "{aws:ECSAutoScalingGroup.AutoScalingGroupName}"
+                    },
+                    "aggregation_dimensions" : [["ImageId"], ["InstanceId", "InstanceType"], ["d1"],[]],
+                    "force_flush_interval" : 30
+                  },
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+                            "log_group_name": "amazon-cloudwatch-agent.log",
+                            "log_stream_name": "amazon-cloudwatch-agent.log",
+                            "timezone": "UTC"
+                          },
+                          {
+                            "file_path": "/opt/aws/amazon-cloudwatch-agent/logs/test.log",
+                            "log_group_name": "test.log",
+                            "log_stream_name": "test.log",
+                            "timezone": "Local"
+                          }
+                        ]
+                      }
+                    },
+                    "log_stream_name": "my_log_stream_name",
+                    "force_flush_interval" : 15
+                  }
+                }
+          packages: 
+            yum:
+              amazon-efs-utils: []
+            rpm:
+              amazon-cloudwatch-agent: "https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+          commands: 
+            05_mkdir:
+              command: mkdir -p /efs && chmod 777 /efs
+              test: test ! -d /efs
+            10_mount:
+              command: !Join [ "", [ "mount -t efs -o tls ", !ImportValue '!Ref EFS', "/efs" ] ]
+              test: !Join [ "", [ "test ! ", "\"$(mount | grep ", !ImportValue '!Ref EFS', ")\"" ] ]
+            20_fstab:
+              command: !Join [ "", [ "echo \"", !ImportValue '!Ref EFS', ":/", " /efs", " efs", " tls,_netdev 0 0\"", " >> /etc/fstab" ] ]
+              test: !Join [ "", [ "test ! ", "\"$(grep ", !ImportValue '!Ref EFS', " /etc/fstab", ")\"" ] ]
+            30_permissions:
+              command: !Sub "chown -R ec2-user:ec2-user /efs"
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-launch-template"
+      LaunchTemplateData: 
+        IamInstanceProfile: !Ref EC2InstanceProfile
+        InstanceInitiatedShutdownBehavior: terminate
+        InstanceType: !Ref InstanceType
+        ImageId: !FindInMap 
+          - AWSRegionToAMI
+          - !Ref 'AWS::Region'
+          - AMIID
+        KeyName: !Ref KeyName
+        Monitoring:
+          Enabled: true
+        SecurityGroupIds: 
+          - !GetAtt EcsSecurityGroup.GroupId
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              yum update -y aws-cfn-bootstrap
+              yum -y update
+              echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}              
+              /opt/aws/bin/cfn-signal -e $?  --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+
+  EcsService:
+    Type: 'AWS::ECS::Service'
+    DependsOn: LoadBalancerListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0 # Allows service interruption rather than scaling up
+      HealthCheckGracePeriodSeconds: 300 # ToDo: Reduce after stack created
+      LoadBalancers:
+        - ContainerName: 'nextcloud-nginx'
+          ContainerPort: '80'
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      ServiceName: 'nextcloud'
+      Role: !Ref ECSServiceRole
+      SchedulingStrategy: DAEMON
+      TaskDefinition: !Ref EcsTaskDefinition
+
+  ECSEventRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                Resource: '*'
+
+  ECSServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:RegisterTargets'
+                  - 'ec2:Describe*'
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                Resource: '*'
+
+#  ServiceScalingTarget:
+#    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+#    DependsOn: EcsService
+#    Properties:
+#      MaxCapacity: 11
+#      MinCapacity: 1
+#      ResourceId: !Join 
+#        - ''
+#        - - service/
+#          - !Ref ECSCluster
+#          - /
+#          - 'nextcloud'
+##          - !GetAtt 
+##            - EcsService
+##            - Name
+#      RoleARN: !GetAtt 
+#        - AutoscalingRole
+#        - Arn
+#      ScalableDimension: 'ecs:service:DesiredCount'
+#      ServiceNamespace: ecs
+
+# Replace by EcsScalingPolicy      
+#  ServiceScalingPolicy:
+#    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+#    Properties:
+#      PolicyName: AStepPolicy
+#      PolicyType: StepScaling
+#      ScalingTargetId: !Ref ServiceScalingTarget
+#      StepScalingPolicyConfiguration:
+#        AdjustmentType: PercentChangeInCapacity
+#        Cooldown: 60
+#        MetricAggregationType: Average
+#        StepAdjustments:
+#          - MetricIntervalLowerBound: 0
+#            ScalingAdjustment: 200
+
+  EcsScalingPolicy: 
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties: 
+      AdjustmentType: "ChangeInCapacity"
+      PolicyType: "SimpleScaling"
+      Cooldown: "60"
+      AutoScalingGroupName: !Ref "ECSAutoScalingGroup"
+      ScalingAdjustment: 1
+
+  ALB500sAlarmScaleUp:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      EvaluationPeriods: '1'
+      Statistic: Average
+      Threshold: '10'
+      AlarmDescription: Alarm if our ALB generates too many HTTP 500s.
+      Period: '60'
+      AlarmActions:
+        - !Ref EcsScalingPolicy
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - Name: ECSAutoScalingGroup
+          Value: !Ref ECSAutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: HTTPCode_ELB_5XX_Count
+
+Outputs:
+  ecsservice:
+    Value: !Ref EcsService
+  ecscluster:
+    Value: !Ref ECSCluster
+  ecstaskdef:
+    Value: !Ref EcsTaskDefinition
+  ElasticLoadBalancer:
+    Description: Your Application Load Balancer URL
+    Value: !Join 
+      - ''
+      - - !GetAtt 
+          - ElasticLoadBalancer
+          - DNSName
